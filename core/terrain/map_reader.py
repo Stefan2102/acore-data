@@ -1,17 +1,16 @@
-"""
-Binary parser for AzerothCore .map terrain files.
+"""Binary parser for AzerothCore .map terrain files (MAPS v9).
 
-Parses the MAPS v9 format: area IDs, height maps (float/uint16/uint8),
-liquid type/flags/levels, and hole data. Provides bilinear interpolation
-for height queries at arbitrary world coordinates.
+The indexing mirrors ``GridTerrainData`` exactly: heights use the v9
+(129x129) grid plus the v8 (128x128) centre grid with the server's triangle
+interpolation, areas use the flat 16x16 map indexed ``x*16+y``, liquid uses
+entry/flag grids with the server cell math, and holes are honoured.
 """
 
 import struct
 from pathlib import Path
-from typing import Dict, NamedTuple, Optional, Tuple
+from typing import List, Optional
 
 from core.terrain.coords import (
-    GRID_SIZE,
     MAP_TILE_VERTS_V9,
     world_to_map_tile,
 )
@@ -39,6 +38,7 @@ LIQUID_TYPE_WATER = 0x01
 LIQUID_TYPE_OCEAN = 0x02
 LIQUID_TYPE_MAGMA = 0x04
 LIQUID_TYPE_SLIME = 0x08
+LIQUID_TYPE_DARK_WATER = 0x10
 
 # Liquid status flags
 LIQUID_STATUS_NO_WATER = 0x00
@@ -48,52 +48,56 @@ LIQUID_STATUS_IN_WATER = 0x04
 LIQUID_STATUS_UNDER_WATER = 0x08
 
 INVALID_HEIGHT = -100000.0
+MAP_RESOLUTION = 128
+GRID_SIZE = 533.3333
+GROUND_HEIGHT_TOLERANCE = 0.05
+
+_HOLETAB_H = (0x1111, 0x2222, 0x4444, 0x8888)
+_HOLETAB_V = (0x000F, 0x00F0, 0x0F00, 0xF000)
 
 
-class MapFileHeader(NamedTuple):
-    """Parsed .map file header."""
-    magic: bytes
-    version: int
-    build: int
-    area_offset: int
-    area_size: int
-    height_offset: int
-    height_size: int
-    liquid_offset: int
-    liquid_size: int
-    holes_offset: int
-    holes_size: int
+class AreaData:
+    __slots__ = ("grid_area", "area_map")
+
+    def __init__(self, grid_area: int, area_map: List[int]):
+        self.grid_area = grid_area
+        self.area_map = area_map  # flat 256, file order
 
 
-class AreaData(NamedTuple):
-    """Parsed area data for a map tile."""
-    grid_area: int
-    area_map: list  # 16x16 array of uint16 area IDs
+class HeightData:
+    __slots__ = ("grid_height", "grid_max_height", "height_type",
+                 "v9", "v8", "multiplier")
+
+    def __init__(self, grid_height: float, grid_max_height: float,
+                 height_type: str, v9: list, v8: list, multiplier: float):
+        self.grid_height = grid_height
+        self.grid_max_height = grid_max_height
+        self.height_type = height_type
+        self.v9 = v9
+        self.v8 = v8
+        self.multiplier = multiplier
 
 
-class HeightData(NamedTuple):
-    """Parsed height data for a map tile."""
-    grid_height: float
-    grid_max_height: float
-    height_type: str  # "float", "uint16", "uint8", "flat"
-    heights: list  # 129x129 or 128x128 array
-    multiplier: float  # for uint16/uint8 types
+class LiquidData:
+    __slots__ = ("global_entry", "global_flags", "off_x", "off_y",
+                 "width", "height", "level", "entries", "flags", "liquid_map")
 
-
-class LiquidData(NamedTuple):
-    """Parsed liquid data for a map tile."""
-    liquid_level: float
-    liquid_width: int
-    liquid_height: int
-    liquid_off_x: int
-    liquid_off_y: int
-    liquid_types: list  # 16x16 array of liquid type IDs
-    liquid_flags: list  # 16x16 array of liquid flag bytes
-    liquid_map: list  # variable-size liquid height map
+    def __init__(self) -> None:
+        self.global_entry = 0
+        self.global_flags = 0
+        self.off_x = 0
+        self.off_y = 0
+        self.width = 0
+        self.height = 0
+        self.level = INVALID_HEIGHT
+        self.entries: Optional[List[int]] = None  # 256
+        self.flags: Optional[List[int]] = None    # 256
+        self.liquid_map: Optional[List[float]] = None  # width*height
 
 
 class MapTile:
-    """Parsed .map tile with area, height, and liquid data."""
+    __slots__ = ("map_id", "tile_x", "tile_y", "area", "height", "liquid",
+                 "holes")
 
     def __init__(self, map_id: int, tile_x: int, tile_y: int):
         self.map_id = map_id
@@ -102,158 +106,184 @@ class MapTile:
         self.area: Optional[AreaData] = None
         self.height: Optional[HeightData] = None
         self.liquid: Optional[LiquidData] = None
+        self.holes: Optional[List[int]] = None
 
-    def get_height(self, local_x: float, local_y: float) -> float:
-        """Get interpolated height at local tile coordinates (0-1 range)."""
-        if not self.height:
+    def is_hole(self, row: int, col: int) -> bool:
+        """Port of GridTerrainData::isHole (row=x_int, col=y_int)."""
+        if not self.holes:
+            return False
+        cell_row = row // 8
+        cell_col = col // 8
+        hole_row = (row % 8) // 2
+        hole_col = (col - cell_col * 8) // 2
+        hole = self.holes[cell_row * 16 + cell_col]
+        return (hole & _HOLETAB_H[hole_col] & _HOLETAB_V[hole_row]) != 0
+
+    def get_height(self, x: float, y: float) -> float:
+        """World-space height (port of GridTerrainData::getHeight)."""
+        hd = self.height
+        if hd is None:
+            return INVALID_HEIGHT
+        if hd.height_type == "flat":
+            return hd.grid_height
+
+        rx = MAP_RESOLUTION * (32 - x / GRID_SIZE)
+        ry = MAP_RESOLUTION * (32 - y / GRID_SIZE)
+        x_int = int(rx)
+        y_int = int(ry)
+        fx = rx - x_int
+        fy = ry - y_int
+        x_int &= MAP_RESOLUTION - 1
+        y_int &= MAP_RESOLUTION - 1
+
+        if self.is_hole(x_int, y_int):
             return INVALID_HEIGHT
 
-        if self.height.height_type == "flat":
-            return self.height.grid_height
+        if hd.height_type == "uint8":
+            return self._height_uint8(hd, x_int, y_int, fx, fy)
+        if hd.height_type == "uint16":
+            return self._height_uint16(hd, x_int, y_int, fx, fy)
+        return self._height_float(hd, x_int, y_int, fx, fy)
 
-        size = len(self.height.heights)
-        if size == 0:
-            return INVALID_HEIGHT
-
-        # 129x129 grid means 128 cells, each cell has 4 vertices
-        # local coords 0-1 map to grid indices 0-(size-1)
-        grid_size = size - 1  # 128 for v9
-
-        # Convert local coords to grid position
-        fx = local_x * grid_size
-        fy = local_y * grid_size
-
-        # Clamp to valid range
-        fx = max(0.0, min(grid_size, fx))
-        fy = max(0.0, min(grid_size, fy))
-
-        # Bilinear interpolation
-        ix = int(fx)
-        iy = int(fy)
-        dx = fx - ix
-        dy = fy - iy
-
-        ix_next = min(ix + 1, grid_size)
-        iy_next = min(iy + 1, grid_size)
-
-        h00 = self.height.heights[iy][ix]
-        h10 = self.height.heights[iy][ix_next]
-        h01 = self.height.heights[iy_next][ix]
-        h11 = self.height.heights[iy_next][ix_next]
-
-        if self.height.height_type in ("uint16", "uint8"):
-            h00 = self.height.grid_height + h00 * self.height.multiplier
-            h10 = self.height.grid_height + h10 * self.height.multiplier
-            h01 = self.height.grid_height + h01 * self.height.multiplier
-            h11 = self.height.grid_height + h11 * self.height.multiplier
-
-        # Bilinear interpolate
-        h_top = h00 * (1 - dx) + h10 * dx
-        h_bot = h01 * (1 - dx) + h11 * dx
-        return h_top * (1 - dy) + h_bot * dy
-
-    def get_area(self, local_x: float, local_y: float) -> int:
-        """Get area ID at local tile coordinates."""
-        if not self.area or not self.area.area_map:
-            return self.area.grid_area if self.area else 0
-
-        grid_size = 16
-        fx = local_x * grid_size
-        fy = local_y * grid_size
-
-        ix = max(0, min(15, int(fx)))
-        iy = max(0, min(15, int(fy)))
-
-        return self.area.area_map[iy][ix]
-
-    def get_liquid_status(self, local_x: float, local_y: float,
-                          world_z: float) -> dict:
-        """Get liquid status at local tile coordinates.
-
-        Returns dict with: type, level, flags, status, depth_level
-        """
-        if not self.liquid:
-            return {
-                "type": LIQUID_TYPE_NO_WATER,
-                "level": INVALID_HEIGHT,
-                "flags": 0,
-                "status": LIQUID_STATUS_NO_WATER,
-                "depth_level": INVALID_HEIGHT,
-            }
-
-        grid_size = 16
-        fx = local_x * grid_size
-        fy = local_y * grid_size
-
-        ix = max(0, min(15, int(fx)))
-        iy = max(0, min(15, int(fy)))
-
-        liquid_type = self.liquid.liquid_types[iy][ix] if self.liquid.liquid_types else LIQUID_TYPE_NO_WATER
-        liquid_flag = self.liquid.liquid_flags[iy][ix] if self.liquid.liquid_flags else 0
-
-        if liquid_type == LIQUID_TYPE_NO_WATER:
-            return {
-                "type": LIQUID_TYPE_NO_WATER,
-                "level": INVALID_HEIGHT,
-                "flags": 0,
-                "status": LIQUID_STATUS_NO_WATER,
-                "depth_level": INVALID_HEIGHT,
-            }
-
-        # Calculate liquid level
-        if self.liquid.liquid_map and len(self.liquid.liquid_map) > 0:
-            # Interpolate from liquid height map
-            off_x = self.liquid.liquid_off_x
-            off_y = self.liquid.liquid_off_y
-            width = self.liquid.liquid_width
-            height = self.liquid.liquid_height
-
-            map_x = (ix - off_x) * width
-            map_y = (iy - off_y) * height
-
-            if (0 <= map_x < len(self.liquid.liquid_map) and
-                    0 <= map_y < len(self.liquid.liquid_map[0])):
-                liquid_level = self.liquid.liquid_level + self.liquid.liquid_map[map_x][map_y]
+    @staticmethod
+    def _height_float(hd: HeightData, x_int: int, y_int: int,
+                      x: float, y: float) -> float:
+        v9 = hd.v9
+        v8 = hd.v8
+        if x + y < 1:
+            if x > y:
+                h1 = v9[x_int * 129 + y_int]
+                h2 = v9[(x_int + 1) * 129 + y_int]
+                h5 = 2 * v8[x_int * 128 + y_int]
+                a = h2 - h1
+                b = h5 - h1 - h2
+                c = h1
             else:
-                liquid_level = self.liquid.liquid_level
+                h1 = v9[x_int * 129 + y_int]
+                h3 = v9[x_int * 129 + y_int + 1]
+                h5 = 2 * v8[x_int * 128 + y_int]
+                a = h5 - h1 - h3
+                b = h3 - h1
+                c = h1
         else:
-            liquid_level = self.liquid.liquid_level
+            if x > y:
+                h2 = v9[(x_int + 1) * 129 + y_int]
+                h4 = v9[(x_int + 1) * 129 + y_int + 1]
+                h5 = 2 * v8[x_int * 128 + y_int]
+                a = h2 + h4 - h5
+                b = h4 - h2
+                c = h5 - h4
+            else:
+                h3 = v9[x_int * 129 + y_int + 1]
+                h4 = v9[(x_int + 1) * 129 + y_int + 1]
+                h5 = 2 * v8[x_int * 128 + y_int]
+                a = h4 - h3
+                b = h3 + h4 - h5
+                c = h5 - h4
+        return a * x + b * y + c
 
-        # Determine status based on Z position relative to liquid level
-        status = LIQUID_STATUS_NO_WATER
-        depth_level = INVALID_HEIGHT
-
-        if world_z > liquid_level:
-            status = LIQUID_STATUS_ABOVE_WATER
-        elif world_z == liquid_level:
-            status = LIQUID_STATUS_WATER_WALK
-            depth_level = liquid_level
+    @staticmethod
+    def _height_uint16(hd: HeightData, x_int: int, y_int: int,
+                       x: float, y: float) -> float:
+        v9 = hd.v9
+        v8 = hd.v8
+        i = x_int * 128 + x_int + y_int
+        if x + y < 1:
+            if x > y:
+                h1 = v9[i]
+                h2 = v9[i + 129]
+                h5 = 2 * v8[x_int * 128 + y_int]
+                a = h2 - h1
+                b = h5 - h1 - h2
+                c = h1
+            else:
+                h1 = v9[i]
+                h3 = v9[i + 1]
+                h5 = 2 * v8[x_int * 128 + y_int]
+                a = h5 - h1 - h3
+                b = h3 - h1
+                c = h1
         else:
-            status = LIQUID_STATUS_IN_WATER | LIQUID_STATUS_UNDER_WATER
-            depth_level = liquid_level
+            if x > y:
+                h2 = v9[i + 129]
+                h4 = v9[i + 130]
+                h5 = 2 * v8[x_int * 128 + y_int]
+                a = h2 + h4 - h5
+                b = h4 - h2
+                c = h5 - h4
+            else:
+                h3 = v9[i + 1]
+                h4 = v9[i + 130]
+                h5 = 2 * v8[x_int * 128 + y_int]
+                a = h4 - h3
+                b = h3 + h4 - h5
+                c = h5 - h4
+        return ((a * x) + (b * y) + c) * hd.multiplier + hd.grid_height
 
-        return {
-            "type": liquid_type,
-            "level": liquid_level,
-            "flags": liquid_flag,
-            "status": status,
-            "depth_level": depth_level,
-        }
+    @staticmethod
+    def _height_uint8(hd: HeightData, x_int: int, y_int: int,
+                      x: float, y: float) -> float:
+        v9 = hd.v9
+        v8 = hd.v8
+        i = x_int * 128 + x_int + y_int
+        if x + y < 1:
+            if x > y:
+                h1 = v9[i]
+                h2 = v9[i + 129]
+                h5 = 2 * v8[x_int * 128 + y_int]
+                a = h2 - h1
+                b = h5 - h1 - h2
+                c = h1
+            else:
+                h1 = v9[i]
+                h3 = v9[i + 1]
+                h5 = 2 * v8[x_int * 128 + y_int]
+                a = h5 - h1 - h3
+                b = h3 - h1
+                c = h1
+        else:
+            if x > y:
+                h2 = v9[i + 129]
+                h4 = v9[i + 130]
+                h5 = 2 * v8[x_int * 128 + y_int]
+                a = h2 + h4 - h5
+                b = h4 - h2
+                c = h5 - h4
+            else:
+                h3 = v9[i + 1]
+                h4 = v9[i + 130]
+                h5 = 2 * v8[x_int * 128 + y_int]
+                a = h4 - h3
+                b = h3 + h4 - h5
+                c = h5 - h4
+        return ((a * x) + (b * y) + c) * hd.multiplier + hd.grid_height
+
+    def get_area(self, x: float, y: float) -> int:
+        """World-space area id (port of GridTerrainData::getArea)."""
+        if not self.area:
+            return 0
+        if not self.area.area_map:
+            return self.area.grid_area
+        rx = 16 * (32 - x / GRID_SIZE)
+        ry = 16 * (32 - y / GRID_SIZE)
+        lx = int(rx) & 15
+        ly = int(ry) & 15
+        return self.area.area_map[lx * 16 + ly]
 
 
 class MapReader:
     """Reads and caches .map terrain files."""
 
     def __init__(self, maps_path: Path):
-        self.maps_path = maps_path
-        self._cache: Dict[Tuple[int, int, int], MapTile] = {}
+        self.maps_path = Path(maps_path)
+        self._cache = {}
 
     def _get_tile_path(self, map_id: int, tile_x: int, tile_y: int) -> Path:
         from core.terrain.coords import map_tile_filename
         return self.maps_path / map_tile_filename(map_id, tile_x, tile_y)
 
     def get_tile(self, map_id: int, tile_x: int, tile_y: int) -> Optional[MapTile]:
-        """Get or load a map tile. Returns None if file doesn't exist."""
+        """Get or load a map tile. Returns None if the file doesn't exist."""
         cache_key = (map_id, tile_x, tile_y)
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -266,246 +296,117 @@ class MapReader:
         try:
             self._parse_file(tile_path, tile)
         except Exception as e:
-            raise RuntimeError(
-                f"Failed to parse {tile_path.name}: {e}"
-            ) from e
+            raise RuntimeError(f"Failed to parse {tile_path.name}: {e}") from e
 
         self._cache[cache_key] = tile
         return tile
 
     def get_height(self, map_id: int, world_x: float, world_y: float) -> float:
-        """Get terrain height at world coordinates."""
+        """Terrain height at world coordinates (INVALID_HEIGHT when absent)."""
         tile_x, tile_y = world_to_map_tile(world_x, world_y)
         tile = self.get_tile(map_id, tile_x, tile_y)
         if not tile:
             return INVALID_HEIGHT
-
-        from core.terrain.coords import world_to_local_tile
-        local_x, local_y = world_to_local_tile(world_x, world_y, tile_x, tile_y)
-        return tile.get_height(local_x, local_y)
+        return tile.get_height(world_x, world_y)
 
     def get_area(self, map_id: int, world_x: float, world_y: float) -> int:
-        """Get area ID at world coordinates."""
         tile_x, tile_y = world_to_map_tile(world_x, world_y)
         tile = self.get_tile(map_id, tile_x, tile_y)
         if not tile:
             return 0
+        return tile.get_area(world_x, world_y)
 
-        from core.terrain.coords import world_to_local_tile
-        local_x, local_y = world_to_local_tile(world_x, world_y, tile_x, tile_y)
-        return tile.get_area(local_x, local_y)
-
-    def get_liquid(self, map_id: int, world_x: float, world_y: float,
-                   world_z: float) -> dict:
-        """Get liquid data at world coordinates."""
-        tile_x, tile_y = world_to_map_tile(world_x, world_y)
-        tile = self.get_tile(map_id, tile_x, tile_y)
-        if not tile:
-            return {
-                "type": LIQUID_TYPE_NO_WATER,
-                "level": INVALID_HEIGHT,
-                "flags": 0,
-                "status": LIQUID_STATUS_NO_WATER,
-                "depth_level": INVALID_HEIGHT,
-            }
-
-        from core.terrain.coords import world_to_local_tile
-        local_x, local_y = world_to_local_tile(world_x, world_y, tile_x, tile_y)
-        return tile.get_liquid_status(local_x, local_y, world_z)
+    # ---- parsing ----
 
     def _parse_file(self, path: Path, tile: MapTile) -> None:
-        """Parse a .map binary file."""
         with open(path, "rb") as f:
             data = f.read()
 
-        # Parse file header (40 bytes)
-        if len(data) < 40:
-            raise ValueError("File too small for map header")
-
-        magic = data[0:4]
-        if magic != MAP_MAGIC:
-            raise ValueError(f"Invalid map magic: {magic!r}, expected {MAP_MAGIC!r}")
-
+        if len(data) < 44 or data[0:4] != MAP_MAGIC:
+            raise ValueError("Invalid map magic")
         version, build = struct.unpack_from("<II", data, 4)
         if version != MAP_VERSION:
             raise ValueError(f"Unsupported map version: {version}")
-
         (area_offset, area_size, height_offset, height_size,
          liquid_offset, liquid_size, holes_offset, holes_size
          ) = struct.unpack_from("<IIIIIIII", data, 12)
 
-        # Parse area data
         if area_offset > 0 and area_size > 0:
-            tile.area = self._parse_area(data, area_offset, area_size)
-
-        # Parse height data
+            tile.area = self._parse_area(data, area_offset)
         if height_offset > 0 and height_size > 0:
-            tile.height = self._parse_height(data, height_offset, height_size)
-
-        # Parse liquid data
+            tile.height = self._parse_height(data, height_offset)
         if liquid_offset > 0 and liquid_size > 0:
-            tile.liquid = self._parse_liquid(data, liquid_offset, liquid_size)
+            tile.liquid = self._parse_liquid(data, liquid_offset)
+        if holes_offset > 0 and holes_size > 0 and holes_size >= 512:
+            tile.holes = list(struct.unpack_from("<256H", data, holes_offset))
 
-    def _parse_area(self, data: bytes, offset: int, size: int) -> AreaData:
-        """Parse area section: AREA magic + header + 16x16 grid."""
-        magic = data[offset:offset + 4]
-        if magic != AREA_MAGIC:
-            raise ValueError(f"Invalid area magic: {magic!r}")
-
-        # map_areaHeader: fourcc(4) + flags(2) + gridArea(2) = 8 bytes
+    @staticmethod
+    def _parse_area(data: bytes, offset: int) -> AreaData:
+        if data[offset:offset + 4] != AREA_MAGIC:
+            raise ValueError("Invalid area magic")
         flags, grid_area = struct.unpack_from("<Hh", data, offset + 4)
-
         if flags & MAP_AREA_NO_AREA:
             return AreaData(grid_area=grid_area, area_map=[])
-
-        # 16x16 uint16 area IDs
-        area_start = offset + 8
-        area_map = []
-        for row in range(16):
-            row_data = []
-            for col in range(16):
-                val = struct.unpack_from("<H", data, area_start + (row * 16 + col) * 2)[0]
-                row_data.append(val)
-            area_map.append(row_data)
-
+        area_map = list(struct.unpack_from("<256H", data, offset + 8))
         return AreaData(grid_area=grid_area, area_map=area_map)
 
-    def _parse_height(self, data: bytes, offset: int, size: int) -> HeightData:
-        """Parse height section: MHT magic + header + height grid."""
-        magic = data[offset:offset + 4]
-        if magic != HEIGHT_MAGIC:
-            raise ValueError(f"Invalid height magic: {magic!r}")
-
-        # map_heightHeader: fourcc(4) + flags(4) + gridHeight(4) + gridMaxHeight(4) = 16 bytes
+    @staticmethod
+    def _parse_height(data: bytes, offset: int) -> HeightData:
+        if data[offset:offset + 4] != HEIGHT_MAGIC:
+            raise ValueError("Invalid height magic")
         flags, grid_height, grid_max_height = struct.unpack_from(
             "<Iff", data, offset + 4
         )
+        pos = offset + 16
 
         if flags & MAP_HEIGHT_NO_HEIGHT:
-            return HeightData(
-                grid_height=grid_height,
-                grid_max_height=grid_max_height,
-                height_type="flat",
-                heights=[],
-                multiplier=1.0,
-            )
+            return HeightData(grid_height, grid_max_height, "flat", [], [], 1.0)
 
-        height_start = offset + 16
-
+        n9 = MAP_TILE_VERTS_V9  # 129
+        n8 = 128
         if flags & MAP_HEIGHT_AS_INT8:
-            # 129x129 uint8 heights
+            v9 = list(struct.unpack_from(f"<{n9 * n9}B", data, pos))
+            pos += n9 * n9
+            v8 = list(struct.unpack_from(f"<{n8 * n8}B", data, pos))
             multiplier = (grid_max_height - grid_height) / 255.0
-            heights = []
-            idx = height_start
-            for row in range(MAP_TILE_VERTS_V9):
-                row_data = list(struct.unpack_from(
-                    f"<{MAP_TILE_VERTS_V9}B", data, idx
-                ))
-                heights.append(row_data)
-                idx += MAP_TILE_VERTS_V9
-            return HeightData(
-                grid_height=grid_height,
-                grid_max_height=grid_max_height,
-                height_type="uint8",
-                heights=heights,
-                multiplier=multiplier,
-            )
-
+            return HeightData(grid_height, grid_max_height, "uint8", v9, v8,
+                              multiplier)
         if flags & MAP_HEIGHT_AS_INT16:
-            # 129x129 uint16 heights
+            v9 = list(struct.unpack_from(f"<{n9 * n9}H", data, pos))
+            pos += n9 * n9 * 2
+            v8 = list(struct.unpack_from(f"<{n8 * n8}H", data, pos))
             multiplier = (grid_max_height - grid_height) / 65535.0
-            heights = []
-            idx = height_start
-            for row in range(MAP_TILE_VERTS_V9):
-                row_data = list(struct.unpack_from(
-                    f"<{MAP_TILE_VERTS_V9}H", data, idx
-                ))
-                heights.append(row_data)
-                idx += MAP_TILE_VERTS_V9 * 2
-            return HeightData(
-                grid_height=grid_height,
-                grid_max_height=grid_max_height,
-                height_type="uint16",
-                heights=heights,
-                multiplier=multiplier,
-            )
+            return HeightData(grid_height, grid_max_height, "uint16", v9, v8,
+                              multiplier)
+        v9 = list(struct.unpack_from(f"<{n9 * n9}f", data, pos))
+        pos += n9 * n9 * 4
+        v8 = list(struct.unpack_from(f"<{n8 * n8}f", data, pos))
+        return HeightData(grid_height, grid_max_height, "float", v9, v8, 1.0)
 
-        # Float heights (129x129)
-        heights = []
-        idx = height_start
-        for row in range(MAP_TILE_VERTS_V9):
-            row_data = list(struct.unpack_from(
-                f"<{MAP_TILE_VERTS_V9}f", data, idx
-            ))
-            heights.append(row_data)
-            idx += MAP_TILE_VERTS_V9 * 4
-        return HeightData(
-            grid_height=grid_height,
-            grid_max_height=grid_max_height,
-            height_type="float",
-            heights=heights,
-            multiplier=1.0,
-        )
-
-    def _parse_liquid(self, data: bytes, offset: int, size: int) -> LiquidData:
-        """Parse liquid section: MLIQ magic + header + liquid grids."""
-        magic = data[offset:offset + 4]
-        if magic != LIQUID_MAGIC:
-            raise ValueError(f"Invalid liquid magic: {magic!r}")
-
-        # map_liquidHeader: fourcc(4) + flags(1) + liquidFlags(1) + liquidType(2) +
-        #                    offsetX(1) + offsetY(1) + width(1) + height(1) + liquidLevel(4) = 16 bytes
+    @staticmethod
+    def _parse_liquid(data: bytes, offset: int) -> LiquidData:
+        if data[offset:offset + 4] != LIQUID_MAGIC:
+            raise ValueError("Invalid liquid magic")
         (flags, liquid_flag, liquid_type, off_x, off_y,
          width, height, liquid_level
          ) = struct.unpack_from("<BBhBBBBf", data, offset + 4)
 
+        liquid = LiquidData()
+        liquid.global_entry = liquid_type
+        liquid.global_flags = liquid_flag
+        liquid.off_x = off_x
+        liquid.off_y = off_y
+        liquid.width = width
+        liquid.height = height
+        liquid.level = liquid_level
+
         pos = offset + 16
-        end = offset + size
-
-        # Parse liquid type entries (16x16 uint16)
-        liquid_types = []
         if not (flags & MAP_LIQUID_NO_TYPE):
-            for row in range(16):
-                row_data = list(struct.unpack_from(
-                    "<16H", data, pos
-                ))
-                liquid_types.append(row_data)
-                pos += 16 * 2
-
-        # Parse liquid flags (16x16 uint8) - only present when NO_HEIGHT is NOT set
-        liquid_flags = []
-        if not (flags & MAP_LIQUID_NO_HEIGHT) and pos + 256 <= end:
-            for row in range(16):
-                row_data = list(struct.unpack_from(
-                    "<16B", data, pos
-                ))
-                liquid_flags.append(row_data)
-                pos += 16
-
-        # Parse liquid height map (width*16*height*16 floats)
-        liquid_map = []
-        if not (flags & MAP_LIQUID_NO_HEIGHT) and width > 0 and height > 0:
-            for row in range(height):
-                row_data = []
-                for col in range(width):
-                    cell_count = 16
-                    if pos + cell_count * 4 > end:
-                        break
-                    cell_data = list(struct.unpack_from(
-                        f"<{cell_count}f", data, pos
-                    ))
-                    row_data.append(cell_data)
-                    pos += cell_count * 4
-                liquid_map.append(row_data)
-                liquid_map.append(row_data)
-
-        return LiquidData(
-            liquid_level=liquid_level,
-            liquid_width=width,
-            liquid_height=height,
-            liquid_off_x=off_x,
-            liquid_off_y=off_y,
-            liquid_types=liquid_types,
-            liquid_flags=liquid_flags,
-            liquid_map=liquid_map,
-        )
+            liquid.entries = list(struct.unpack_from("<256H", data, pos))
+            pos += 512
+            liquid.flags = list(struct.unpack_from("<256B", data, pos))
+            pos += 256
+        if not (flags & MAP_LIQUID_NO_HEIGHT):
+            count = width * height
+            liquid.liquid_map = list(struct.unpack_from(f"<{count}f", data, pos))
+        return liquid

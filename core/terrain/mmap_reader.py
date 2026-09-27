@@ -13,7 +13,40 @@ from core.terrain.coords import mmap_main_filename, mmap_tile_filename
 
 
 MMAP_MAGIC = 0x4D4D4150  # "MMAP"
-MMAP_VERSION = 19
+MMAP_VERSION = 20
+
+
+class NavMeshParams(NamedTuple):
+    """dtNavMeshParams as stored in the main {map}.mmap file (28 bytes).
+
+    Note: the file has no magic/version header; it is exactly the struct:
+    float orig[3]; float tileWidth; float tileHeight; int maxTiles; int maxPolys.
+    """
+    orig: Tuple[float, float, float]
+    tile_width: float
+    tile_height: float
+    max_tiles: int
+    max_polys: int
+
+
+def parse_navmesh_params(path) -> Optional[NavMeshParams]:
+    """Parse the main .mmap navmesh params file (dtNavMeshParams)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(28)
+    except OSError:
+        return None
+    if len(data) < 28:
+        return None
+    ox, oy, oz, tw, th = struct.unpack_from("<5f", data, 0)
+    max_tiles, max_polys = struct.unpack_from("<ii", data, 20)
+    return NavMeshParams(
+        orig=(ox, oy, oz),
+        tile_width=tw,
+        tile_height=th,
+        max_tiles=max_tiles,
+        max_polys=max_polys,
+    )
 
 # Detour constants
 DT_NAVMESH_MAGIC = 0x444E4156  # "DNAV" as little-endian uint32
@@ -147,33 +180,22 @@ class MMapReader:
         return info
 
     def get_main_info(self, map_id: int) -> dict:
-        """Get info about the main .mmap file (navmesh params)."""
+        """Get info about the main .mmap file (dtNavMeshParams)."""
         main_path = self.mmaps_path / mmap_main_filename(map_id)
         if not main_path.exists():
             return {"exists": False}
 
-        # The main .mmap file contains dtNavMeshParams
-        # Format: magic(4) + version(4) + origX(4) + origY(4) + origZ(4) +
-        #         tileWidth(4) + tileHeight(4) + maxTiles(4) + maxLay(4)
-        with open(main_path, "rb") as f:
-            data = f.read(36)
-
-        if len(data) < 36:
+        params = parse_navmesh_params(main_path)
+        if params is None:
             return {"exists": True, "error": "File too small"}
-
-        magic, version = struct.unpack_from("<II", data, 0)
-        orig_x, orig_y, orig_z = struct.unpack_from("<fff", data, 8)
-        tile_w, tile_h, max_tiles, max_lay = struct.unpack_from("<IIII", data, 18)
 
         return {
             "exists": True,
-            "magic": hex(magic),
-            "version": version,
-            "origin": {"x": orig_x, "y": orig_y, "z": orig_z},
-            "tile_width": tile_w,
-            "tile_height": tile_h,
-            "max_tiles": max_tiles,
-            "max_layers": max_lay,
+            "origin": {"x": params.orig[0], "y": params.orig[1], "z": params.orig[2]},
+            "tile_width": params.tile_width,
+            "tile_height": params.tile_height,
+            "max_tiles": params.max_tiles,
+            "max_polys": params.max_polys,
             "file_size": main_path.stat().st_size,
         }
 

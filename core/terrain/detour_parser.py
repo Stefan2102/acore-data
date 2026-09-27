@@ -19,7 +19,6 @@ Coordinate convention: Detour Z-up  (y=AC_x, z=AC_y, x=AC_z).
 
 from __future__ import annotations
 
-import math
 import struct
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -52,6 +51,7 @@ class DetourPoly:
     vert_count: int = 0
     area: int = 0
     ptype: int = 0
+    index: int = -1                                      # index within the tile
 
     @property
     def is_offmesh(self) -> bool:
@@ -66,6 +66,31 @@ class DetourBVNode:
 
 
 @dataclass
+class DetourOffMeshConnection:
+    """A dtOffMeshConnection (36 bytes on disk):
+    pos[6] (start xyz, end xyz), radius, poly index, link flags, side,
+    user id."""
+    pos: Tuple[float, float, float, float, float, float] = (0.0,) * 6
+    radius: float = 0.0
+    poly: int = 0
+    flags: int = 0
+    side: int = 0
+    user_id: int = 0
+
+    @property
+    def start(self) -> Tuple[float, float, float]:
+        return (self.pos[0], self.pos[1], self.pos[2])
+
+    @property
+    def end(self) -> Tuple[float, float, float]:
+        return (self.pos[3], self.pos[4], self.pos[5])
+
+    @property
+    def bidirectional(self) -> bool:
+        return bool(self.flags & DT_OFFMESH_CON_BIDIR)
+
+
+@dataclass
 class DetourTileData:
     # Header
     x: int = 0
@@ -77,6 +102,10 @@ class DetourTileData:
     walkable_radius: float = 0.0
     walkable_climb: float = 0.0
     bv_quant_factor: float = 0.0
+    magic: int = 0
+    version: int = 0
+    user_id: int = 0
+    off_mesh_base: int = 0
 
     # Geometry
     vertices: List[Tuple[float, float, float]] = field(default_factory=list)
@@ -89,7 +118,7 @@ class DetourTileData:
     detail_tris: List[Tuple[int, int, int, int]] = field(default_factory=list)
 
     # Off-mesh connections
-    off_mesh_cons: List[Tuple[float, ...]] = field(default_factory=list)
+    off_mesh_cons: List[DetourOffMeshConnection] = field(default_factory=list)
 
     def get_poly_vertices(self, idx: int) -> List[Tuple[float, float, float]]:
         p = self.polygons[idx]
@@ -134,12 +163,15 @@ class DetourParser:
         if h[1] != DT_NAVMESH_VERSION:
             raise ValueError(f"Bad version {h[1]}")
 
+        tile.magic, tile.version = magic, h[1]
         tile.x, tile.y, tile.layer = h[2], h[3], h[4]
+        tile.user_id = h[5]
         poly_count, vert_count, max_link_count = h[6], h[7], h[8]
         detail_mesh_count = h[9]
         detail_vert_count, detail_tri_count = h[10], h[11]
         bv_node_count, off_mesh_con_count = h[12], h[13]
         off_mesh_base = h[14]
+        tile.off_mesh_base = off_mesh_base
         tile.walkable_height = h[15]
         tile.walkable_radius = h[16]
         tile.walkable_climb = h[17]
@@ -178,6 +210,7 @@ class DetourParser:
             poly.vert_count = vert_cnt
             poly.area = area
             poly.ptype = ptype
+            poly.index = i
             tile.polygons.append(poly)
         off += poly_count * poly_size
 
@@ -223,159 +256,22 @@ class DetourParser:
                 ))
             off += _align4(bv_node_count * 16)
 
-        # 9. Off-mesh connections  (68 bytes each)
+        # 9. Off-mesh connections (dtOffMeshConnection, 36 bytes each):
+        #    pos[6] floats, radius f32, poly u16, flags u8, side u8, userId u32
         for i in range(off_mesh_con_count):
-            base = off + i * 68
+            base = off + i * 36
             pos = struct.unpack_from("<6f", data, base)
-            rad = struct.unpack_from("<f", data, base + 24)[0]
-            side = struct.unpack_from("<f", data, base + 28)[0]
-            poly = struct.unpack_from("<H", data, base + 32)[0]
-            flags = data[base + 34]
-            dir_ = data[base + 35]
-            area_from = data[base + 36]
-            area_to = data[base + 37]
-            tile.off_mesh_cons.append((*pos, rad, side, poly, flags, dir_, area_from, area_to))
-            off += _align4(68)
+            radius = struct.unpack_from("<f", data, base + 24)[0]
+            poly = struct.unpack_from("<H", data, base + 28)[0]
+            flags = data[base + 30]
+            con_side = data[base + 31]
+            user_id = struct.unpack_from("<I", data, base + 32)[0]
+            tile.off_mesh_cons.append(DetourOffMeshConnection(
+                pos=tuple(pos), radius=radius, poly=poly,
+                flags=flags, side=con_side, user_id=user_id,
+            ))
+        off += off_mesh_con_count * _align4(36)
 
         self._tile = tile
         return tile
 
-    # ---- queries ----
-
-    def find_nearest_poly(self, point: Tuple[float, float, float],
-                          max_dist: float = 50.0,
-                          filter_flags: int = 0xFFFF) -> Tuple[int, float]:
-        """Linear BV-tree nearest-polygon search (matches Detour query).
-
-        Detour traverses the BV tree linearly: leaf nodes have i>=0
-        (polygon index), internal nodes have i<0 and are skipped.
-
-        Returns (poly_index, dist_sq) or (-1, inf).
-        """
-        if not self._tile or not self._tile.bv_nodes:
-            return (-1, float("inf"))
-
-        tile = self._tile
-        best_idx, best_d2 = -1, max_dist * max_dist
-
-        for node in tile.bv_nodes:
-            if node.i < 0:
-                continue  # internal node, skip
-            d2 = _dist_pt_aabb_sq(point, node.bmin, node.bmax)
-            if d2 > best_d2:
-                continue
-            pi = node.i
-            if pi >= len(tile.polygons):
-                continue
-            p = tile.polygons[pi]
-            if p.is_offmesh or not (p.flags & filter_flags):
-                continue
-            d2 = _dist_pt_poly_sq(point, tile, pi)
-            if d2 < best_d2:
-                best_d2 = d2
-                best_idx = pi
-
-        return (best_idx, best_d2)
-
-    def get_poly_neighbors(self, poly_idx: int) -> List[Tuple[int, int, int]]:
-        """Return [(neighbor_poly_idx, edge_start_vert, edge_end_vert), ...]."""
-        if not self._tile or poly_idx >= len(self._tile.polygons):
-            return []
-        poly = self._tile.polygons[poly_idx]
-        result: List[Tuple[int, int, int]] = []
-        n = poly.vert_count
-        for i in range(n):
-            ref = poly.neis[i]
-            if ref == DT_NULL_LINK or ref == 0:
-                continue
-            neighbour = ref & 0xFFFF
-            if neighbour < len(self._tile.polygons):
-                result.append((neighbour, i, (i + 1) % n))
-        return result
-
-    def get_poly_height(self, poly_idx: int, x: float, z: float) -> Optional[float]:
-        """Height on polygon plane at (x, z)."""
-        if not self._tile or poly_idx >= len(self._tile.polygons):
-            return None
-        vs = self._tile.get_poly_vertices(poly_idx)
-        if len(vs) < 3:
-            return None
-        v0, v1, v2 = vs[0], vs[1], vs[2]
-        e1 = (v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2])
-        e2 = (v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2])
-        nx = e1[1] * e2[2] - e1[2] * e2[1]
-        ny = e1[2] * e2[0] - e1[0] * e2[2]
-        nz = e1[0] * e2[1] - e1[1] * e2[0]
-        if abs(ny) < 1e-6:
-            return None
-        d = -(nx * v0[0] + ny * v0[1] + nz * v0[2])
-        return -(nx * x + d + nz * z) / ny
-
-
-# ---- helpers ----
-
-def _dist_pt_aabb_sq(p: Tuple[float, float, float],
-                     mn: Tuple[float, float, float],
-                     mx: Tuple[float, float, float]) -> float:
-    d = 0.0
-    for i in range(3):
-        if p[i] < mn[i]:
-            d += (mn[i] - p[i]) ** 2
-        elif p[i] > mx[i]:
-            d += (p[i] - mx[i]) ** 2
-    return d
-
-
-def _dist_pt_poly_sq(p: Tuple[float, float, float],
-                     tile: DetourTileData,
-                     pi: int) -> float:
-    vs = tile.get_poly_vertices(pi)
-    if len(vs) < 3:
-        return float("inf")
-    v0, v1, v2 = vs[0], vs[1], vs[2]
-    e1 = (v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2])
-    e2 = (v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2])
-    nx = e1[1] * e2[2] - e1[2] * e2[1]
-    ny = e1[2] * e2[0] - e1[0] * e2[2]
-    nz = e1[0] * e2[1] - e1[1] * e2[0]
-    lsq = nx * nx + ny * ny + nz * nz
-    if lsq < 1e-12:
-        return float("inf")
-    t = (nx * p[0] + ny * p[1] + nz * p[2] +
-         (-(nx * v0[0] + ny * v0[1] + nz * v0[2]))) / lsq
-    px, py, pz = p[0] + t * nx, p[1] + t * ny, p[2] + t * nz
-    if _pt_in_poly_2d(px, py, pz, vs):
-        return t * t * lsq
-    # closest edge
-    best = float("inf")
-    n = len(vs)
-    for i in range(n):
-            d = _dist_pt_seg_sq(p, vs[i], vs[(i + 1) % n])
-            if d < best:
-                best = d
-    return best
-
-
-def _pt_in_poly_2d(px: float, py: float, pz: float,
-                   vs: List[Tuple[float, float, float]]) -> bool:
-    n = len(vs)
-    inside = False
-    j = n - 1
-    for i in range(n):
-        yi, zi = vs[i][1], vs[i][2]
-        yj, zj = vs[j][1], vs[j][2]
-        if ((zi > pz) != (zj > pz)) and (py < (yj - yi) * (pz - zi) / (zj - zi) + yi):
-            inside = not inside
-        j = i
-    return inside
-
-
-def _dist_pt_seg_sq(p: Tuple[float, float, float],
-                    a: Tuple[float, float, float],
-                    b: Tuple[float, float, float]) -> float:
-    dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
-    lsq = dx * dx + dy * dy + dz * dz
-    if lsq < 1e-12:
-        return sum((p[i] - a[i]) ** 2 for i in range(3))
-    t = max(0.0, min(1.0, sum((p[i] - a[i]) * (b[i] - a[i]) for i in range(3)) / lsq))
-    return sum((p[i] - (a[i] + t * (b[i] - a[i]))) ** 2 for i in range(3))

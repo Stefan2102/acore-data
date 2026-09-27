@@ -3,8 +3,9 @@
 The mod-playerbots TravelMgr builds bot travel routes from a node/path graph
 stored in `acore_playerbots` (playerbots_travelnode / playerbots_travelnode_path,
 ~1.4M path points). This tool inspects that graph statically and verifies
-paths against the actual MMap terrain data - the same mmap/vmap data the
-worldserver uses at runtime - without needing a running server.
+paths against the server's vmap-aware floor heights (Map::GetHeight) - the
+same WMO/terrain collision the worldserver uses at runtime - without needing
+a running server.
 
 Modes (all read-only, acore_playerbots + mmap data; the mod DB is optional -
 absence is a clean error, not a crash):
@@ -18,6 +19,7 @@ from typing import Any, Dict, List, Optional
 DB = "acore_playerbots"
 _MAX_POINTS_SHOWN = 200
 _OFF_GROUND_TOLERANCE = 5.0
+_VERIFY_RESOLVERS: Dict[tuple, Any] = {}
 
 
 class _TravelError(Exception):
@@ -154,24 +156,29 @@ def _node_details(server, map_id: int, node_id: int) -> Dict[str, Any]:
 
 
 def _verify_path(server, map_id: int, points: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Check path points against MMap terrain. Best-effort: no mmap data for
-    the map degrades to a note instead of an error."""
+    """Check path points against the vmap-aware floor (same heights the
+    worldserver uses). Best-effort: missing data degrades to a note."""
     try:
-        from core.terrain.map_reader import MapReader, INVALID_HEIGHT
-        from core.terrain.coords import get_data_paths
+        from core.terrain.map_resolver import MapResolver, INVALID_HEIGHT
     except Exception as e:  # terrain core not present
         return {"checked": 0, "note": f"terrain core unavailable: {e}"}
 
-    try:
-        reader = MapReader(get_data_paths()["maps"])
-    except Exception as e:
-        return {"checked": 0, "note": f"could not open maps data: {e}"}
+    key = ("travel_verify", map_id)
+    resolver = _VERIFY_RESOLVERS.get(key)
+    if resolver is None:
+        try:
+            resolver = MapResolver(map_id, dbc_lookup=server._load_dbc)
+        except Exception as e:
+            return {"checked": 0, "note": f"could not open terrain data: {e}"}
+        _VERIFY_RESOLVERS[key] = resolver
 
     checked = 0
     off_ground = []
     for pt in points:
-        h = reader.get_height(map_id, pt["x"], pt["y"])
-        if h == INVALID_HEIGHT:
+        h = resolver.get_floor_height(pt["x"], pt["y"], pt["z"])
+        if h <= INVALID_HEIGHT:
+            h = resolver.get_ground_height(pt["x"], pt["y"])
+        if h <= INVALID_HEIGHT:
             continue
         checked += 1
         dz = abs(pt["z"] - h)
@@ -184,14 +191,15 @@ def _verify_path(server, map_id: int, points: List[Dict[str, Any]]) -> Dict[str,
         "checked": checked,
         "off_ground_count": len(off_ground),
         "off_ground_examples": off_ground,
+        "method": "vmap floor height (server Map::GetHeight)",
     }
     if checked == 0:
-        result["note"] = "no MMap terrain data for this map - verification skipped"
+        result["note"] = "no terrain data for this map - verification skipped"
         return result
     if not off_ground:
         result["note"] = (
             f"all {checked} points sit within {_OFF_GROUND_TOLERANCE}m of the "
-            "MMap ground - path is terrain-consistent"
+            "server floor - path is terrain-consistent"
         )
     return result
 
@@ -307,7 +315,8 @@ def get_schema() -> Dict[str, Any]:
             "MMap navmesh (no running server needed). travel(map=M): graph stats "
             "(nodes/edges/path points). travel(map=M, node=N): node details + "
             "neighbours. travel(map=M, from=A, to=B): decoded path points plus "
-            "terrain verification (points off the ground by >5m are flagged). "
+            "terrain verification against the vmap-aware server floor (points "
+            "off the ground by >5m are flagged). "
             "Requires acore_playerbots (mod-playerbots); its absence is a clean "
             "error. Arbitrary-coordinate routing is done at runtime by the "
             "worldserver (TravelMgr)."

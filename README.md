@@ -273,17 +273,31 @@ sql(query="SELECT * FROM creature_templat LIMIT 1")
 
 ### `terrain`
 
-Query map, VMap, and MMap terrain data — terrain height, liquid, area IDs, navmesh tiles, and cross-tile pathfinding on the Detour navmesh.
+Query map, VMap, and MMap terrain data the way the running server does —
+ADT heights/liquids, WMO/M2 vmap raycasts (floors, line of sight, hits),
+area/zone resolution, and Detour pathfinding equivalent to the `.mmap path`
+GM command (uncapped by default).
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `subcommand` | string | **Required.** One of: `list_maps`, `list_tiles`, `height`, `liquid`, `area`, `coord`, `tile_info`, `vmap_info`, `tile_stats`, `map_info`, `pathfind`. |
+| `subcommand` | string | **Required.** One of: `list_maps`, `list_tiles`, `height`, `position`, `liquid`, `area`, `coord`, `tile_info`, `vmap_info`, `tile_stats`, `map_info`, `pathfind`, `los`, `raycast`. |
 | `mapId` | string or number | Map ID (numeric) or name (e.g. `"Eastern Kingdoms"`, `"571"`). |
 | `x`, `y`, `z` | number | World coordinates (required by subcommand). |
+| `orientation` | number | Optional orientation echoed by `position`. |
 | `tileX`, `tileY` | number | Tile coordinates 0-63 (for tile-level queries). |
 | `data_type` | string | `"maps"`, `"vmaps"`, or `"mmaps"` (for `list_tiles`, `tile_info`). |
-| `x1`, `y1`, `z1`, `x2`, `y2`, `z2` | number | Start/end coordinates (for `pathfind`). |
-| `flying` | boolean | Ignore height constraints (for `pathfind`, default `false`). |
+| `x1`, `y1`, `z1`, `x2`, `y2`, `z2` | number | Start/end coordinates (for `pathfind`, `los`, `raycast`). |
+| `mode` | string | `pathfind` building mode: `smooth` (default, `.mmap path`), `straight` (`.mmap path true`), `raycast` (`.mmap path ray`). |
+| `unit` | string | Movement profile: `player` (default), `creature`, `flying` (2-point shortcut). |
+| `flying` | boolean | Legacy alias for `unit="flying"`. |
+| `normalize` | boolean | Clamp path Z to the server floor/water level (default `true`). |
+| `headless` | boolean | Use the stricter playerbots filter (no steep slopes, avoid water). |
+| `collision_height` | number | Unit collision height for Z offsets (default `2.03128`). |
+| `max_nodes` / `max_polys` / `max_points` | number | Optional caps (default **unlimited**; the server caps at 1024 nodes and 74/148 polys). |
+| `limit` | number | Max path points returned (default 2000; `points_truncated` is set when capped). |
+| `ignore_m2` | boolean | `los` only: ignore M2 doodad collision. |
+| `modify_dist` | number | `raycast` only: offset applied to the hit point. |
+| `include_mmap` | boolean | `position` only: include nearest navmesh poly (default `true`). |
 
 **Subcommands:**
 
@@ -291,23 +305,37 @@ Query map, VMap, and MMap terrain data — terrain height, liquid, area IDs, nav
 |------------|---------|
 | `list_maps` | List all maps with file counts (ADT, VMap, MMap) |
 | `list_tiles` | List tiles for a map (maps, vmaps, or mmaps) |
-| `height` | Terrain height at (x, y) |
-| `liquid` | Liquid type/height at (x, y, z) |
-| `area` | Area table ID at (x, y) |
+| `height` | ADT terrain height plus the vmap-aware floor height (pass `z`) |
+| `position` | `.gps`-equivalent: terrain Z, floor Z, area/zone, liquid, indoors/outdoors, nearest navmesh poly |
+| `liquid` | Liquid level/status at (x, y, z) (WMO liquid first, then ADT) |
+| `area` | Area and zone IDs/names at (x, y[, z]) |
 | `coord` | Convert world coordinates to grid/tile |
 | `tile_info` | MMap/VMap tile header info |
-| `vmap_info` | VMap model info for a tile |
+| `vmap_info` | VMap spawn/model metadata for a tile (or the tree) |
 | `tile_stats` | Navmesh statistics for a tile (poly count, vertex count) |
 | `map_info` | MMap navmesh parameters for a map |
-| `pathfind` | A* pathfinding between two points with cross-tile support |
+| `pathfind` | Server-style path between two points (smooth/straight/raycast, uncapped) |
+| `los` | Static line of sight between two points (vmap geometry) |
+| `raycast` | First vmap hit position along a segment (`GetObjectHitPos`) |
 
 **Pathfinding:**
 
-The `pathfind` subcommand runs A* on the Detour navmesh with on-demand tile loading, cross-tile external edge resolution, and funnel-algorithm corridor steering. Coordinates are in world space. The AC world→Detour transform `(world_y, world_z, world_x)` is applied automatically.
+`pathfind` is a faithful port of AzerothCore's `PathGenerator`: start/end
+polygon resolution with the same search extents, Detour A* with AzerothCore's
+slope-aware traversal cost, `FindSmoothPath` (4-yard steps along the navmesh
+surface, the `.mmap path` default), straight-path string pulling, raycast
+mode, and `UpdateAllowedPositionZ` normalization (floor/water clamping) using
+the same vmap collision data as the server. Unlike the worldserver there is
+no node/path cap unless you pass one, so long routes (>900 yards) complete
+in a single call.
 
 ```
-terrain(subcommand="height", mapId=0, x=1620, y=1530)
-→ {"height": 52.34, "map_id": 0, "position": {"x": 1620, "y": 1530}}
+terrain(subcommand="position", mapId=0, x=-8832, y=628, z=94)
+→ {"terrain_z": 59.46, "floor_z": 94.01, "area": {"id": 1519, "name": "Stormwind City"}, "outdoors": true, …}
+
+terrain(subcommand="pathfind", mapId=0, mode="smooth",
+        x1=-9464, y1=64, z1=55, x2=-8832, y2=628, z2=100)
+→ {"found": true, "path_type_names": ["NORMAL"], "distance": 880.8, "point_count": 220, …}
 
 terrain(subcommand="list_tiles", mapId=571, data_type="mmaps")
 → 433 MMap tiles for Wintergrasp
@@ -500,12 +528,22 @@ acore-data/
 │   │   └── ref_utils.py         # Shared helpers: resolve_dbc_ref, resolve_sql_ref, …
 │   └── terrain/                 # Terrain data: map/vmap/mmap readers, navmesh pathfinding
 │       ├── coords.py            # World ↔ tile coordinate conversions
-│       ├── map_reader.py        # ADT map file reader (height, liquid, area)
-│       ├── vmap_reader.py       # VMap model file reader
-│       ├── mmap_reader.py       # MMap navmesh tile index reader
-│       ├── detour_parser.py     # Detour tile parser (polygons, BV tree, vertices)
-│       ├── tile_manager.py      # On-demand tile loading, cross-tile link resolution
-│       └── pathfinder.py        # A* search, corridor steering, cross-tile pathfinding
+│       ├── map_reader.py        # ADT map file reader (server-exact height/liquid/area indexing)
+│       ├── vmap_reader.py       # VMap tile/tree metadata reader
+│       ├── mmap_reader.py       # MMap tile header + dtNavMeshParams reader
+│       ├── detour_parser.py     # Detour tile parser (polygons, BV tree, off-mesh connections)
+│       ├── map_resolver.py      # Server map logic: GetHeight, full terrain status, areas, liquids
+│       ├── path_generator.py    # PathGenerator port: smooth/straight/raycast + normalization
+│       ├── detour/              # Detour navmesh query port
+│       │   ├── navmesh.py       # Multi-tile store, link construction (internal/external/off-mesh)
+│       │   ├── query.py         # findPath/findStraightPath/moveAlongSurface/raycast ports
+│       │   ├── filter.py        # dtQueryFilter + AzerothCore slope-aware dtQueryFilterExt
+│       │   └── mathutil.py      # Detour geometry helpers
+│       └── vmap/                # VMAP collision stack
+│           ├── bih.py           # Bounding Interval Hierarchy traversal
+│           ├── world_model.py   # .vmo WMO/M2 parser, group models, WMO liquid
+│           ├── tree.py          # StaticMapTree: spawns, tiles, raycasts, location info
+│           └── math3d.py        # G3D-compatible matrix/ray math
 │
 ├── tools/
 │   ├── __init__.py              # Tool schema registry, SQL-mode gate (ACORE_SQL_TOOL_MODE)

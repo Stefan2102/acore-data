@@ -95,8 +95,9 @@ integration test class; the exact tool set is asserted by `test_list_tools`):
   flag. The "what server am I talking to?" gate.
 - `travel(map_id, mode, node, from, to)` — playerbots travel-graph tool:
   `stats` (nodes/edges/points), `node` (details + neighbours), `path`
-  (decoded from `playerbots_travelnode_path`, navmesh height verification
-  via `MapReader` — degrades gracefully when .map data is absent).
+  (decoded from `playerbots_travelnode_path`, verification against the
+  vmap-aware server floor via `MapResolver` — degrades gracefully when
+  terrain data is absent).
 - `encounter(entry|instance|map_id)` — instance/map rollup: top creatures
   (level, rank, loot), gameobjects, instance metadata. Real AzerothCore loot
   table is `creature_loot_template`; backtick `rank` (MySQL 8 reserved word);
@@ -119,6 +120,50 @@ the registry/DB/DBC path is independent.
 **Module naming gotcha**: `core/enums.py` is the pre-existing lookup
 dictionary module (GO_TYPE_NAMES etc., imported by `core.type_resolver`);
 the source-scanning index is `core/enum_index.py`. Do not merge/rename.
+
+## Terrain / pathfinding semantics (server parity)
+
+`tools/terrain.py` is a port of the worldserver's own terrain stack — keep it
+aligned with the AzerothCore sources rather than with convenience shortcuts.
+
+- `position` mirrors `.gps`: `terrain_z` = ADT grid height, `floor_z` =
+  `WorldObject::GetMapHeight` (vmap raycast with 50y search, ADT fallback),
+  area/zone via `Map::GetAreaId` + `WMOAreaTable`, liquid via
+  `Map::GetLiquidData` (WMO liquid first, ADT liquid fallback), outdoors via
+  `GetFullTerrainStatusForPosition`. Dynamic game-object/transport collision
+  is NOT statically reproducible and is called out in the response metadata.
+- `pathfind` is a `PathGenerator` port: `smooth` (default = `.mmap path`),
+  `straight` (`.mmap path true`), `raycast` (`.mmap path ray`); `normalize`
+  applies `UpdateAllowedPositionZ` with a player-like collision profile.
+  Default caps are unlimited — the server caps at 1024 A* nodes and
+  74 polys (148 with `MOD_PLAYERBOTS`); pass `max_nodes`/`max_polys`/
+  `max_points` to reproduce partial server paths. Unreachable endpoints make
+  an uncapped A* exhaust the reachable component (can take minutes).
+- Two mmap tile frames exist: **file names** use world grid coords
+  `{map}{gx:02}{gy:02}.mmtile`, while the Detour mesh header `x/y` are derived
+  from `dtNavMeshParams.orig` (`dtNavMesh::calcTileLoc`). `detour/navmesh.py`
+  indexes one to the other by reading tile headers (never assume they match).
+  VMap tile files are `{map}_{gy}_{gx}.vmtile` (Y first).
+- VMap collision data uses the mirrored internal representation
+  (`x' = mid - x`, `y' = mid - y`, mid ≈ 17066.67) and model files are
+  `<spawn.name>.vmo`; spawn names may carry trailing NULs (truncate like
+  `fopen` does). `StaticMapTree::getHeight` raycasts only loaded tiles, so
+  `vmap/tree.py` loads the containing tile + neighbours on demand.
+- `map_reader.py` mirrors `GridTerrainData` exactly: v9 (129²) + v8 (128²)
+  height grids with triangle interpolation, the holes bitmask, the flat 16×16
+  area map indexed `x*16+y`, and liquid entry/flag grids with
+  `LiquidType`/`AreaTable` overrides.
+- The main `{map}.mmap` file is a raw 28-byte `dtNavMeshParams` (orig,
+  tileWidth/Height, maxTiles, maxPolys) — no magic/version header.
+- Detour on-disk polygon `neis` are 1-based internal indices or
+  `DT_EXT_LINK | side` (sides 0/2/4/6 = +x/+z/-x/-z); off-mesh records are
+  36-byte `dtOffMeshConnection` structs.
+- Manual parity checks (a GM client on the same install): run `.gps` next to
+  `terrain position` and `.mmap path` (plus `.mmap path true` / `.mmap path
+  ray`) next to `terrain pathfind` with the same coordinates; the smooth path
+  points, floor Z and area/zone ids should agree (dynamic objects/transports
+  excepted). Golden fixtures recorded in TestTerrainTool cover the
+  Stormwind/Searing Gorge cases automatically.
 
 ## Gotchas
 
@@ -172,20 +217,23 @@ the source-scanning index is `core/enum_index.py`. Do not merge/rename.
 
 ## Tests
 
-- `tests/test_helpers.py` — 42 fast unit tests (no DB), incl. enum-index
-  parser coverage, per-DB credential precedence, overlay projection and
-  worldserver.conf auto-detection.
+- `tests/test_helpers.py` — 51 fast unit tests (no DB), incl. enum-index
+  parser coverage, per-DB credential precedence, overlay projection,
+  worldserver.conf auto-detection, and terrain parser checks (navmesh
+  params, tile frames, vmap spawns/BIH, WorldModel raycast — the terrain
+  ones skip when the client data is absent, so CI still runs clean).
 - `tests/test_smoke.py` — 3 boot smoke tests (DB-free; spawn `server.py`
   in degraded asset-less mode and assert the MCP protocol answers —
   the "stranger clones the repo" path).
 - `tests/test_regression.py` — 29 tests, the rework's contract (shape,
   strictness, links, protocol, registry audit, format parser). Requires
   live DBC + MySQL (install-local).
-- `tests/test_integration.py` — 110 tests (live DB + DBC; each test spawns
+- `tests/test_integration.py` — 123 tests (live DB + DBC; each test spawns
   the server via subprocess and needs ~10 s). One test class per tool, incl.
-  TestConfigTool and TestEnumsTool (skip gracefully when the mod-playerbots /
-  azerothcore source trees are absent) and `test_list_tools` (asserts the
-  exact tool set — update it when adding a tool).
+  TestTerrainTool (server-parity heights/position/pathfinding), TestConfigTool
+  and TestEnumsTool (skip gracefully when the mod-playerbots / azerothcore
+  source trees are absent) and `test_list_tools` (asserts the exact tool set —
+  update it when adding a tool).
 - CI (`.github/workflows/ci.yml`) runs only the DB-free gate on
   Python 3.10/3.12/3.13: `test_helpers` + `test_smoke` + the structural
   registry audit. `test_regression` / `test_integration` need a live

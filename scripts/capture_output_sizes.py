@@ -64,6 +64,22 @@ SCENARIOS = {
         "tool": "list",
         "args": {"category": "dbc_backed"},
     },
+    "terrain_height_stormwind": {
+        "tool": "terrain",
+        "args": {"subcommand": "height", "mapId": 0,
+                 "x": -8832.0, "y": 628.0, "z": 100.0},
+    },
+    "terrain_position_stormwind": {
+        "tool": "terrain",
+        "args": {"subcommand": "position", "mapId": 0,
+                 "x": -8832.0, "y": 628.0, "z": 94.0},
+    },
+    "terrain_pathfind_short": {
+        "tool": "terrain",
+        "args": {"subcommand": "pathfind", "mapId": 0,
+                 "x1": -9464.0, "y1": 64.0, "z1": 55.0,
+                 "x2": -8832.0, "y2": 628.0, "z2": 100.0},
+    },
 }
 
 

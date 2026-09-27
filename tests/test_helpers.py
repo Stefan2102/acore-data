@@ -556,5 +556,101 @@ class TestPerDbCreds(unittest.TestCase):
                 locked.chmod(0o755)
 
 
+class TestTerrainParsers(unittest.TestCase):
+    """core.terrain parsers against the live client data (skipped without)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from core.terrain.coords import get_data_paths
+        cls.paths = get_data_paths()
+
+    def _require(self, path, label):
+        if not Path(path).exists():
+            self.skipTest(f"{label} not present ({path})")
+
+    def test_navmesh_params(self):
+        from core.terrain.mmap_reader import parse_navmesh_params
+        path = Path(self.paths["mmaps"]) / "000.mmap"
+        self._require(path, "mmaps")
+        params = parse_navmesh_params(path)
+        self.assertIsNotNone(params)
+        self.assertAlmostEqual(params.tile_width, 533.3333, places=3)
+        self.assertAlmostEqual(params.tile_height, 533.3333, places=3)
+        self.assertGreater(params.max_tiles, 0)
+        self.assertAlmostEqual(params.orig[0], -6933.333, places=2)
+
+    def test_mmap_tile_frames(self):
+        from core.terrain.detour import NavMesh
+        self._require(Path(self.paths["mmaps"]) / "0004830.mmtile", "mmaps")
+        nav = NavMesh(0, self.paths["mmaps"])
+        # Stormwind world coords -> Detour header tile (14, 13) -> file 0004830
+        point = (628.0, 100.0, -8832.0)  # detour (y, z, x)
+        self.assertEqual(nav.calc_tile_loc(point), (14, 13))
+        self.assertEqual(nav.tile_file(14, 13).name, "0004830.mmtile")
+
+    def test_vmap_tile_filename_is_y_first(self):
+        from core.terrain.vmap_reader import VMapReader
+        self.assertEqual(VMapReader.tile_filename(0, 48, 30), "000_30_48.vmtile")
+
+    def test_vmap_tile_spawn_metadata(self):
+        from core.terrain.vmap_reader import VMapReader
+        path = Path(self.paths["vmaps"]) / "000_30_48.vmtile"
+        self._require(path, "vmaps")
+        info = VMapReader(self.paths["vmaps"]).get_tile_info(0, 48, 30)
+        self.assertIsNotNone(info)
+        self.assertEqual(info.spawn_count, 3849)
+        self.assertEqual(info.model_count, 184)  # distinct .vmo files
+        self.assertEqual(info.wmo_spawns, 1)
+        self.assertTrue(all("\x00" not in name for name in info.models))
+
+    def test_vmap_tree_bih(self):
+        from core.terrain.vmap import StaticMapTree
+        self._require(Path(self.paths["vmaps"]) / "000.vmtree", "vmaps")
+        tree = StaticMapTree(0, self.paths["vmaps"])
+        self.assertTrue(tree.valid)
+        self.assertTrue(tree.is_tiled)
+        self.assertGreater(tree.tree.prim_count, 100000)
+
+    def test_world_model_raycast_stormwind(self):
+        from core.terrain.vmap import StaticMapTree
+        self._require(Path(self.paths["vmaps"]) / "000.vmtree", "vmaps")
+        tree = StaticMapTree(0, self.paths["vmaps"])
+        height = tree.get_height(-8832.0, 628.0, 105.0)
+        # WMO street level; ADT terrain below is ~59.46
+        self.assertAlmostEqual(height, 94.0051, delta=0.05)
+        far = tree.get_height(-8832.0, 628.0, 200.0)
+        self.assertEqual(far, float("inf"))  # outside the 50y search distance
+
+    def test_detour_offmesh_parse(self):
+        from core.terrain.detour_parser import DetourParser
+        tile = Path(self.paths["mmaps"]) / "5622031.mmtile"
+        self._require(tile, "mmaps")
+        raw = tile.read_bytes()[56:]
+        data = DetourParser().parse(raw)
+        self.assertGreater(len(data.off_mesh_cons), 0)
+        con = data.off_mesh_cons[0]
+        self.assertGreater(con.radius, 0)
+        self.assertLess(con.poly, len(data.polygons))
+        self.assertIn(con.flags & 0x02, (0, 2))
+
+    def test_player_filter_flags(self):
+        from core.terrain.detour import NAV_GROUND, NAV_GROUND_STEEP, NAV_MAGMA, NAV_WATER, player_filter
+        filt = player_filter()
+        self.assertEqual(
+            filt.include_flags,
+            NAV_GROUND | NAV_GROUND_STEEP | NAV_WATER | NAV_MAGMA,
+        )
+        self.assertEqual(filt.exclude_flags, 0)
+
+    def test_seg_seg_intersection(self):
+        from core.terrain.detour.query import _intersect_seg_seg_2d
+        ap, aq = (0.0, 0.0, 0.0), (10.0, 0.0, 10.0)
+        bp, bq = (10.0, 0.0, 0.0), (0.0, 0.0, 10.0)
+        s, t = _intersect_seg_seg_2d(ap, aq, bp, bq)
+        self.assertIsNotNone(s)
+        self.assertAlmostEqual(s, 0.5, places=6)
+        self.assertAlmostEqual(t, 0.5, places=6)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1341,6 +1341,160 @@ class TestSpawnsTool(unittest.TestCase):
         self.assertTrue(r.get("isError"))
 
 
+class TestTerrainTool(unittest.TestCase):
+    """terrain tool: server-parity heights, positions and pathfinding."""
+
+    def test_height_vmap_floor_stormwind(self):
+        r = call_tool("terrain", {
+            "subcommand": "height", "mapId": 0,
+            "x": -8832.0, "y": 628.0, "z": 100.0,
+        })
+        self.assertAlmostEqual(r["terrain_height"], 59.456, places=2)
+        self.assertAlmostEqual(r["floor_height"], 94.005, delta=0.1)
+        self.assertEqual(r["source"], "vmap")
+        self.assertAlmostEqual(r["vmap_height"], 94.005, delta=0.1)
+
+    def test_position_stormwind(self):
+        r = call_tool("terrain", {
+            "subcommand": "position", "mapId": 0,
+            "x": -8832.0, "y": 628.0, "z": 94.0,
+        })
+        self.assertEqual(r["map_name"], "Eastern Kingdoms")
+        self.assertEqual(r["area"]["id"], 1519)
+        self.assertEqual(r["area"]["name"], "Stormwind City")
+        self.assertEqual(r["zone"]["id"], 1519)
+        self.assertAlmostEqual(r["terrain_z"], 59.456, places=2)
+        self.assertAlmostEqual(r["floor_z"], 94.005, delta=0.1)
+        self.assertTrue(r["have"]["map"])
+        self.assertTrue(r["have"]["vmap"])
+        self.assertTrue(r["have"]["mmap"])
+        # WMO interior data is present and floors come from the vmap
+        self.assertIsNotNone(r["vmap"])
+        self.assertIn("mogp_flags", r["vmap"]["wmo"])
+        self.assertTrue(r["mmap"]["found"])
+        self.assertLess(r["mmap"]["distance"], 2.0)
+
+    def test_area_and_zone_goldshire(self):
+        r = call_tool("terrain", {
+            "subcommand": "area", "mapId": 0, "x": -9464.0, "y": 64.0,
+        })
+        self.assertEqual(r["area_id"], 87)
+        self.assertEqual(r["area_name"], "Goldshire")
+        self.assertEqual(r["zone_id"], 12)
+        self.assertEqual(r["zone_name"], "Elwynn Forest")
+
+    def test_liquid_water(self):
+        r = call_tool("terrain", {
+            "subcommand": "liquid", "mapId": 0,
+            "x": -9459.0, "y": -200.0, "z": 56.0,
+        })
+        self.assertNotEqual(r["status"], 0)
+        self.assertGreater(r["liquid_level"], 50.0)
+        self.assertGreater(r["liquid_type"], 0)
+
+    def test_vmap_info_tile_counts(self):
+        r = call_tool("terrain", {
+            "subcommand": "vmap_info", "mapId": 0, "tileX": 48, "tileY": 30,
+        })
+        self.assertEqual(r["spawn_count"], 3849)
+        self.assertEqual(r["wmo_spawns"], 1)
+        self.assertGreater(r["model_count"], 100)
+
+    def test_map_info_navmesh_params(self):
+        r = call_tool("terrain", {"subcommand": "map_info", "mapId": 0})
+        self.assertTrue(r["exists"])
+        self.assertAlmostEqual(r["tile_width"], 533.3333, places=3)
+        self.assertGreater(r["max_tiles"], 0)
+
+    def test_pathfind_long_route_over_900yds(self):
+        # Searing Gorge dig site -> Thorium Point (stored travel path ~1141y)
+        r = call_tool("terrain", {
+            "subcommand": "pathfind", "mapId": 0,
+            "x1": -7023.96, "y1": -1721.88, "z1": 241.764,
+            "x2": -6559.26, "y2": -1100.23, "z2": 310.353,
+        })
+        self.assertTrue(r["found"])
+        self.assertEqual(r["path_type"], 1)  # PATHFIND_NORMAL
+        self.assertFalse(r["partial"])
+        self.assertFalse(r["max_nodes_exceeded"])
+        self.assertGreater(r["distance"], 900.0)
+        self.assertGreater(r["point_count"], 100)
+        self.assertGreater(r["poly_count"], 50)
+        last = r["points"][-1]
+        self.assertAlmostEqual(last["x"], -6559.26, places=1)
+        self.assertAlmostEqual(last["y"], -1100.23, places=1)
+
+    def test_pathfind_smooth_matches_server_surface(self):
+        r = call_tool("terrain", {
+            "subcommand": "pathfind", "mapId": 0,
+            "x1": -9464.0, "y1": 64.0, "z1": 55.0,
+            "x2": -8832.0, "y2": 628.0, "z2": 100.0,
+        })
+        self.assertTrue(r["found"])
+        self.assertEqual(r["path_type"], 1)
+        self.assertGreater(r["point_count"], 50)
+        # final point snapped to the Stormwind WMO floor, not the ADT terrain
+        self.assertAlmostEqual(r["points"][-1]["z"], 94.0, delta=1.0)
+        # smooth mode steps ~4 yards between points
+        p0, p1 = r["points"][0], r["points"][1]
+        step = ((p1["x"] - p0["x"]) ** 2 + (p1["y"] - p0["y"]) ** 2
+                + (p1["z"] - p0["z"]) ** 2) ** 0.5
+        self.assertLess(step, 5.0)
+
+    def test_pathfind_straight_and_raycast_modes(self):
+        straight = call_tool("terrain", {
+            "subcommand": "pathfind", "mapId": 0, "mode": "straight",
+            "x1": -9464.0, "y1": 64.0, "z1": 55.0,
+            "x2": -8832.0, "y2": 628.0, "z2": 100.0,
+        })
+        self.assertTrue(straight["found"])
+        self.assertEqual(straight["mode"], "straight")
+        self.assertGreater(straight["point_count"], 2)
+        self.assertLess(straight["point_count"], 200)
+
+        ray = call_tool("terrain", {
+            "subcommand": "pathfind", "mapId": 0, "mode": "raycast",
+            "x1": -9464.0, "y1": 64.0, "z1": 55.0,
+            "x2": -8832.0, "y2": 628.0, "z2": 100.0,
+        })
+        self.assertEqual(ray["mode"], "raycast")
+        self.assertNotEqual(ray["path_type"] & 0x08, 0x08)  # not NOPATH
+
+    def test_pathfind_flying_shortcut(self):
+        r = call_tool("terrain", {
+            "subcommand": "pathfind", "mapId": 0, "flying": True,
+            "x1": -9464.0, "y1": 64.0, "z1": 55.0,
+            "x2": -8832.0, "y2": 628.0, "z2": 100.0,
+        })
+        self.assertTrue(r["found"])
+        self.assertEqual(r["point_count"], 2)
+        self.assertIn("NOT_USING_PATH", r["path_type_names"])
+
+    def test_los_blocked_by_wmo(self):
+        r = call_tool("terrain", {
+            "subcommand": "los", "mapId": 0,
+            "x1": -8832.0, "y1": 628.0, "z1": 100.0,
+            "x2": -8832.0, "y2": 628.0, "z2": 60.0,
+        })
+        self.assertFalse(r["visible"])
+        self.assertTrue(r["blocked"])
+
+    def test_raycast_hits_stormwind_floor(self):
+        r = call_tool("terrain", {
+            "subcommand": "raycast", "mapId": 0,
+            "x1": -8832.0, "y1": 628.0, "z1": 200.0,
+            "x2": -8832.0, "y2": 628.0, "z2": 50.0,
+        })
+        self.assertTrue(r["hit"])
+        self.assertAlmostEqual(r["position"]["z"], 94.005, delta=0.1)
+
+    def test_unknown_subcommand_lists_valid(self):
+        r = call_tool("terrain", {"subcommand": "bogus"})
+        self.assertIn("error", r)
+        self.assertIn("pathfind", r["valid_subcommands"])
+        self.assertIn("position", r["valid_subcommands"])
+
+
 if __name__ == "__main__":
     # Run from acore-data directory
     unittest.main(verbosity=2)
